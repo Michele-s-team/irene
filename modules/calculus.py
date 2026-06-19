@@ -1,0 +1,966 @@
+'''
+Calculs utilities for finite-element computations.
+
+Provides standalone helpers for:
+  - Parametric curves (line, circle, circle_arc, ellipse, ellipse_arc),
+    each returning [position, derivative] over t in [0, 1].
+  - Curvilinear integrals along curves and over mesh internal facets
+    (curve_integral_*, curve_integral_dS).
+  - Surface integrals over planar regions: rectangles, disks, rings,
+    ellipses, polygons (surface_integral_*).
+  - 3D surface/volume integrals over spheres, balls, and boxes.
+  - Rotations and coordinate transforms (R, R_z, dRddtheta,
+    polar_to_cartesian, rotation_translation).
+  - Geometric tests and queries (point_on_line, point_on_segment,
+    point_in_box, line_on_axis, line_is_radial, mirror_point_line,
+    polygon_length, min/max distances).
+
+Depends on numpy, scipy, shapely, and FEniCS
+'''
+
+
+from fenics import *
+import numpy as np
+import scipy.integrate as spi
+from scipy.spatial.distance import pdist
+from shapely.geometry import Polygon
+from shapely.ops import triangulate
+import sys
+
+import constants.utils as const
+
+small_number = 1e-3
+
+
+# return the radian angle of vector r by taking into account its quadrant
+def atan_quad(r):
+    if (r[0] > 0):
+        angle = np.arctan(r[1] / r[0])
+    elif (r[0] < 0):
+        angle = np.pi + np.arctan(r[1] / r[0])
+    elif (r[0] == 0):
+        if r[1] > 0:
+            angle = np.pi/2
+        elif r[1] < 0:
+            angle = -np.pi/2
+        elif r[1] == 0:
+            # in this case the angle is not defined -> set it to a nominal value (the function atan_quad should not be called with r[0] = r[1] = 0 anyway
+            angle = 0
+
+    return angle - 2 * np.pi * np.floor(angle / (2 * np.pi))
+
+
+'''
+convert polar to cartesian coordinates
+Input values
+- 'rho', 'theta', 'phi': polar coordinates
+- 'c': the origin of polar coordinates
+Return values: 
+- the tuple corresponding to 'rho', 'theta', 'phi', in cartesian coordinates
+
+'''
+
+
+def polar_to_cartesian(rho, theta, phi, c):
+    return [c[0] + rho * np.sin(theta) * np.cos(phi),
+            c[1] + rho * np.sin(theta) * np.sin(phi),
+            c[2] + rho * np.cos(theta)]
+
+
+'''
+a line in 2d joining the points x_a and x_b, parametrized with 0 <= t <= 1
+it returns the curve and its gradient [[x[0](t), x[1](t)], [x[0]'(t), x[1]'(t)]]
+'''
+
+
+def line(x_a, x_b, t):
+    return [x_a + np.subtract(x_b, x_a) * t, np.subtract(x_b, x_a)]
+
+
+'''
+a circle
+Input values:
+- 'r': the circle radius
+- 'c_r': the circle center (an array of two points)
+- 't' : the parameteric coordinate of the circle, 0<=t<1
+Return values:
+- the curve position and derivative: [x[0](t), x[1](t)], [x[0]'(t), x[1]'(t)]
+'''
+
+
+def circle(r, cr, t):
+    return circle_arc(r, cr, 0, 2 * np.pi, t)
+
+
+'''
+a circle arc
+Input values:
+- 'r': the circle radius
+- 'c_r': the circle center (an array of two points)
+- 'theta_min', 'theta_max': the minimal and maxmimal values of the polar angles of the arg, repsectively
+- 't' : the parameteric coordinate of the circle, 0<=t<1
+Return values:
+- the curve position and derivative: [x[0](t), x[1](t)], [x[0]'(t), x[1]'(t)]
+'''
+
+
+def circle_arc(r, cr, theta_min, theta_max, t):
+    theta_t = theta_min + (theta_max - theta_min) * t
+
+    return [np.add(cr, r * np.array([np.cos(theta_t), np.sin(theta_t)])).tolist(),
+            (r * (theta_max - theta_min) * np.array([- np.sin(theta_t), np.cos(theta_t)])).tolist()]
+
+'''
+the arc of an ellipse rotated with respect to the x axis about its left focal point
+Input values:
+    * Mandatory:
+        - 'a', 'b': the ellipse major and minor axes
+        - 'c': the ellipse center (an array of two points)
+        - 'theta_min', 'theta_max': the minimal and maxmimal values of the polar angles of the arg, respectively
+        - 't' : the parametric coordinate of the ellipse arc, 0<=t<1
+    * Optional:
+        - 'phi': the angle by which the major axis is rotated with respect to the x axis, about the left focal points
+
+Return values:
+    - the curve position and derivative: [x[0](t), x[1](t)], [x[0]'(t), x[1]'(t)]
+'''
+
+def ellipse_arc(a, b, c, theta_min, theta_max, t, phi=0):
+    theta_t = theta_min + (theta_max - theta_min) * t
+
+    f = ellipse_focal_points(a, b, c)[0]
+
+    return [
+        np.add(f, np.dot(R(phi), np.subtract(np.add(c, [a * np.cos(theta_t), b * np.sin(theta_t)]), f) ) ).tolist(),
+        ((theta_max - theta_min) * np.dot(R(phi), [- a * np.sin(theta_t), b * np.cos(theta_t)] )).tolist() 
+            ]
+
+
+'''
+an ellipse rotated about the x axis about its left focal point
+Input values:
+    * Mandatory: 
+        - 'a', 'b': the ellipse major and minor axes
+        - 'c': the ellipse center (an array of two points)
+        - 't' : the parametric coordinate of the ellipse, 0<=t<1
+    * Optional:
+        - 'phi': the angle by which the major axis is rotated with respect to the x axis
+Return values:
+    - the curve position and derivative: [x[0](t), x[1](t)], [x[0]'(t), x[1]'(t)]
+'''
+
+def ellipse(a, b, c, t, phi=0):
+    return ellipse_arc(a, b, c, 0, 2 * np.pi, t, phi)
+
+
+'''
+return the curvilinear integral of a function  along a curve 
+Input values:
+- 'f': the function f(x[0], x[1])
+- 'gamma_dgamma': the curve and its gradient: gamma_dgamma(t) = [[x[0](t), x[1](t)], [x[0]'(t), x[1]'(t)]]
+Return values:
+- 'integral': the integral 
+
+Example of usage:
+    line_test = lambda t: cal.line([np.sqrt(2),0.4], [1.2,1], t)
+    def g(x):
+        return np.sin( x[0]**2 +np.cos( x[1]**2))
+    integral_line_test = cal.curve_integral(g, line_test)
+    print(f'integral_line_test: {integral_line_test}')
+    
+Example of usage:
+    circle_test = lambda t: cal.circle(1.34, [np.sqrt(2), -np.sqrt(3)],  t)
+    def g(x):
+        return np.sin( x[0]**2 +np.cos( x[1]**2))
+    integral_line_test = cal.curve_integral(g, circle_test)
+'''
+
+
+def curve_integral(f, gamma_dgamma):
+    integral = spi.quad(lambda t: (f(gamma_dgamma(t)[0]) * np.linalg.norm((gamma_dgamma(t))[1])), 0, 1)[0]
+    return integral
+
+
+'''
+return the curve integral of a function  along a line 
+Input values:
+- 'f': the function f(x[0], x[1])
+- 'x_a', 'x_b': the start and end points of the line
+Return values: 
+\int_line f dl
+
+Example of usage:
+    def g(x):
+        return np.sin(x[0] ** 2 + np.cos(x[1] ** 2))
+    
+    integral_line = cal.curve_integral_line(g, [1,2],[4,3])
+'''
+
+
+def curve_integral_line(f, x_a, x_b):
+    line_curve = lambda t: line(x_a, x_b, t)
+    return curve_integral(f, line_curve)
+
+
+'''
+compute the integral over the lines of a polygonal chain (a sequence of joint segments) of a function of two variables
+Input values: 
+    - 'f': the function, f([x, y])
+    - 'polygon_coordinates': the list of vertices of the polygonal chain [[v0x, v0y], [v1x, v1y], ... ]
+
+Return values: 
+    - \int_{polygonal chain} dl f
+'''
+def curve_integral_polygon(f, polygon_coordinates):
+
+    # add the integral over the segment that closes the polygon loop
+    result = curve_integral_line(f, polygon_coordinates[-1], polygon_coordinates[0])
+
+    # add the integrals over the other segments
+    for i in range(len(polygon_coordinates)-1):
+        result += curve_integral_line(f, polygon_coordinates[i], polygon_coordinates[i+1])
+
+    return result
+
+
+'''
+return the curve integral of a function  along a circle 
+Input values:
+- 'f': the function f(x[0], x[1])
+- 'r': the circle radius
+- 'c': the circle center (an array of two points)
+Return values: 
+\int_circle f dl
+
+Example of usage:
+    def g(x):
+        return np.sin(x[0] ** 2 + np.cos(x[1] ** 2))
+    
+    integral_circle = cal.curve_integral_circle(g, 1, [1,np.sqrt(2)])
+'''
+
+
+def curve_integral_circle(f, r, c):
+    circle_curve = lambda t: circle(r, c, t)
+    return curve_integral(f, circle_curve)
+
+'''
+return the curve integral of a function  along an ellipse rotated with respect to the x axis about its left focal point
+Input values:
+    * Mandatory:
+        - 'f': the function f(x[0], x[1])
+        - 'a', 'b': the ellipse minor and major axes
+        - 'c': the ellipse center (an array of two points)
+    * Optional:
+        - 'phi': the angle by which the major axis is rotated with respect to the x axis about the left focal point of the ellipse, it is 0 by default
+Return values: 
+    - \int_ellipse f dl
+'''
+def curve_integral_ellipse(f, a, b, c, phi=0):
+
+    ellipse_curve = lambda t: ellipse(a, b, c, t, phi)
+    return curve_integral(f, ellipse_curve)
+
+'''
+return the curve integral of a function  along a circle arc
+Input values:
+- 'f': the function f(x[0], x[1])
+- 'r': the circle radius
+- 'theta_min', 'theta_max': min and max values of the polar angles of the arc, repsectively
+- 'c': the circle-arc center (an array of two points)
+Return values: 
+\int_{circle arc} f dl
+
+'''
+
+
+def curve_integral_circle_arc(f, r, theta_min, theta_max, c):
+    circle_arc_curve = lambda t: circle_arc(r, c, theta_min, theta_max, t)
+    return curve_integral(f, circle_arc_curve)
+
+
+'''
+compute the integral of a function over measure of internal facets 'dS' for a 2d mesh
+Input values: 
+    * Mandatory
+        - 'mesh' the mesh
+        - 'f': the function that will be integrated over 'dS'
+    * Optional: 
+        - 'sf', 'surface_id': the mesh function that is used to tag mesh surfaces, and the tag of the mesh surface to be considered for the calculation. Both are 'None' by default: if not provided, this method computes the curve integral across all internal facets of 'mesh'
+Return values: 
+    - int dS_ f
+
+'''
+def curve_integral_dS(mesh, f, sf=None, surface_id=None):
+
+    result = 0.0
+    cell_tags = None
+
+    # ensure facet->cell connectivity is built
+    mesh.init(1, 2)  
+
+
+    for facet in facets(mesh):
+        # loop through all mesh facets
+
+        if facet.exterior() == False:
+            # the facet under consideration is an internal facet -> consider it for the check
+
+            if sf != None:
+                # this method has been called with 'sf' != None -> consider all cells adjacent to 'facet', compute their tags, and store them in 'cell_tags'
+
+                cell_tags = [sf[Cell(mesh, cell_id)] for cell_id in facet.entities(2)]
+
+            if (((surface_id == None) or (sf == None)) or all(c == surface_id for c in cell_tags)):
+                # the method has been called on the whole mesh, i.e., (surface_id == None) or (sf == None), or it has been called on a specific region of the mesh, and 'facet' is an facet internal to this region -> compute the integral over 'facet' and add it to the result
+
+                '''
+                facet_vertices contains the coordinates of the endpoints of `facet`:
+                facet_vertices = 
+                [
+                    [p_0_x, p_0_y],
+                    [p_1_x, p_1_y]
+                ]
+                ''' 
+                facet_vertices = []
+
+                for v in vertices(facet):
+                    # run through the vertices of `facet`
+
+                    facet_vertices.append((v.point().array().tolist())[:2])
+
+                result += curve_integral_line(f, facet_vertices[0], facet_vertices[1])
+
+    return result
+
+'''
+compute the integral of a function of two variables over a rectangle
+Input values:
+- 'f': the function f([x, y])
+- 'p_bl', 'p_rt': the bottom-left and top-right corner points of the rectangle, each is a list with two entries
+Result: 
+- the integral \int_{rectagnle} dx dy f(x,y)
+
+Example of usage:
+    def g(x):
+        return np.sin(x[0] ** 2 + np.cos(x[1] ** 2))
+    integral = surface_integral_rectangle(g, [-2,0.1], [1,1])
+'''
+
+
+def surface_integral_rectangle(f, p_bl, p_tr):
+    f_swapped = lambda x, y: f([y, x])
+    return spi.dblquad(f_swapped, p_bl[0], p_tr[0], lambda x: p_bl[1], lambda x: p_tr[1])[0]
+
+
+'''
+integate a function of two variables over a ring delimited by two concentric circles
+Input values 
+- 'f': the function f([x, y])
+- 'r', 'R': radii of the inner and outer circle defining the ring
+- 'c' : center of the circles (a list of two values)
+Result:
+- \int_ring dx dy f
+
+Example of usage:
+    def g(x):
+        return np.sin(x[0] ** 2 + np.cos(x[1] ** 2))
+    integral = cal.surface_integral_ring(g, 1/np.sqrt(3), 2, [np.sqrt(11),-0.5])
+'''
+
+
+def surface_integral_ring(f, r, R, c):
+    return surface_integral_ring_slice(f, r, R, 0, 2 * np.pi, c)
+
+
+'''
+integate a function of two variables over the slice of a ring delimited by two concentric circles
+Input values 
+- 'f': the function f([x, y])
+- 'r', 'R': radii of the inner and outer circle defining the ring
+- 'theta_min', 'theta_max': the polar angles delimiting the ring slice
+- 'c' : center of the circles (a list of two values)
+Result:
+- \int_{ring slice} dx dy f
+'''
+
+
+def surface_integral_ring_slice(f, r, R, theta_min, theta_max, c):
+    f_swapped = lambda x, y: f([y, x])
+
+    return spi.dblquad(lambda rho, theta: rho * f_swapped(c[1] + rho * np.sin(theta), c[0] + rho * np.cos(theta)), theta_min, theta_max, lambda rho: r, lambda rho: R)[0]
+
+
+'''
+integate a function of two variables over a disk
+Input values 
+- 'f': the function f([x, y])
+- 'r': radius of the disk
+- 'c' : center of the disk
+Result:
+- \int_disk dx dy f
+
+Example of usage:
+    def g(x):
+        return np.sin(x[0] ** 2 + np.cos(x[1] ** 2))
+    integral = cal.surface_integral_dsk(g, 1/np.sqrt(3), [np.sqrt(11),-0.5])
+'''
+
+
+def surface_integral_disk(f, r, c):
+    return surface_integral_ring(f, 0, r, c)
+
+
+'''
+integrate a function of two variables over an angular slice of a disk
+Input values 
+- 'f': the function f([x, y])
+- 'r': radius of the disk
+- 'theta_min', 'theta_max': the polar angles delimiting the ring slice
+- 'c' : center of the disk
+Result:
+- \int_{disk slice} dx dy f
+
+Example of usage:
+    cal.surface_integral_disk_slice(function_test_integrals,  rmsh.r, np.pi, 2*np.pi, rmsh.c_r)
+'''
+
+
+def surface_integral_disk_slice(f, r, theta_min, theta_max, c):
+    return surface_integral_ring_slice(f, 0, r, theta_min, theta_max, c)
+
+
+'''
+compute the integral of a function in the region between a disk and a rectangle (the rectangle must contain the disk)
+Input values 
+- 'f': the function f([x, y])
+- 'p_bl', 'p_rt': the bottom-left and top-right corner points of the rectangle, each is a list with two entries
+- 'r': radius of the disk
+- 'c' : center of the disk
+Return value: 
+- \int_{rectangle - disk} dx dy f
+
+Example of usage:
+    def g(x):
+        return np.sin(x[0] ** 2 + np.cos(x[1] ** 2))
+    integral = cal.surface_integral_integral_rectangle_minus_disk(g, [-1,-2], [2,3], 0.3, [1,1])
+'''
+
+
+def surface_integral_rectangle_minus_disk(f, p_bl, p_tr, r, c):
+    return surface_integral_rectangle(f, p_bl, p_tr) - surface_integral_disk(f, r, c)
+
+
+'''
+compute the surface integral of a function over an ellipse
+Input values 
+- 'f': the function f([x, y])
+- 'a', 'b': the semi-major and semi-minor axes of the ellipse, respectively
+- 'c': the center of the ellipse
+- 'phi' : the rotation angle of the major axis with respect to the x axis
+
+Return value: 
+- \int_{ellipse} dx dy f
+'''
+
+def surface_integral_ellipse(f, a, b, c, phi):
+    f_swapped = lambda x, y: f([y, x])
+    # rotate the coordinate along the ellipse by phi
+    r = lambda rho, theta: np.dot(R(phi), [a * rho * np.cos(theta), b * rho * np.sin(theta)])
+
+    return spi.dblquad(lambda rho, theta: a * b * rho * f_swapped(c[1] + (r(rho, theta))[1], c[0] + (r(rho, theta))[0]), 0, 2 * np.pi, lambda rho: 0, lambda rho: 1)[0]
+
+
+'''
+compute the integral of a function of two variables over the region delimited by a polygon
+Input values: 
+    - 'f': the function f([x,y])
+    - 'polygon_coordinates': the list of vertices of the polygon [[v0x, v0y], [v1x, v1y], ... ]
+
+Return values: 
+    - \int_polygon dx f
+'''
+def surface_integral_polygon(f, polygon_coordinates):
+
+    polygon = Polygon(polygon_coordinates)
+
+    # triangulate the polygon by dividing it into triangles
+    triangles = [
+        tri for tri in triangulate(polygon)
+        if polygon.contains(tri.centroid)
+    ]
+    
+    total = 0.0
+    for triangle in triangles:
+        # run over all triangles of the triangulation 
+
+        # store the three triangle vertices into vertices
+        vertices = [np.array(p) for p in triangle.exterior.coords[:3]]
+
+        '''
+        one makes a change of variable from the xy plane to the uv plane. The triangle in the xy plane corresponds to the region 0 <= u <= 1, 0 <= v <= 1, u+v<=1 in the uv plane. 
+        The transformation is 
+
+        (x, y) =vertices[0] + u (vertices[1] - vertices[0]) + v (vertices[2] - vertices[0])
+        and the jacobian J is the jacobian of this transformation 
+        '''
+        J = abs((vertices[1][0]-vertices[0][0])*(vertices[2][1]-vertices[0][1]) - (vertices[2][0]-vertices[0][0])*(vertices[1][1]-vertices[0][1]))
+
+        '''
+        integrand re-expressed as a function of u and v
+        '''
+        def integrand(v, u):
+
+            x = vertices[0][0] + (vertices[1][0]-vertices[0][0])*u + (vertices[2][0]-vertices[0][0])*v
+            y = vertices[0][1] + (vertices[1][1]-vertices[0][1])*u + (vertices[2][1]-vertices[0][1])*v
+
+            return f([x, y]) * J
+
+        # store the integral over the triangle in result
+        result, _ = spi.dblquad(integrand, 0, 1, lambda u: 0, lambda u: 1-u)
+
+        # add the integral to the total integral
+        total += result
+
+    
+    return total
+    
+
+
+'''
+compute the surface integral of a function on a sphere
+Input values 
+- 'f': the function f([x, y, z])
+- 'r', 'c_r': radius and center of the ball
+Return values: 
+- \int ds_sphere f
+
+'''
+
+
+def surface_integral_sphere(f, r, c):
+    result = spi.dblquad(
+        lambda theta, phi: f(polar_to_cartesian(r, theta, phi, c)) * r**2 * np.sin(theta),
+        0,  # phi lower bound
+        2*np.pi,  # phi upper bound
+        lambda phi: 0,  # theta lower bound
+        lambda phi: np.pi,  # theta upper bound
+    )[0]
+
+    return result
+
+
+'''
+compute the volume integral of a function in a ball
+Input values 
+- 'f': the function f([x, y, z])
+- 'r', 'c_r': radius and center of the ball
+Return values: 
+- \int dx_ball f
+'''
+
+
+def volume_integral_ball(f, r, c):
+    result = spi.tplquad(
+        lambda rho, theta, phi: f(polar_to_cartesian(rho, theta, phi, c)) * rho ** 2 * np.sin(theta),
+        0,  # phi lower bound
+        2 * np.pi,  # phi upper bound
+        lambda phi: 0,  # theta lower bound
+        lambda phi: np.pi,  # theta upper bound
+        lambda phi, theta: 0,  # rho lower bound
+        lambda phi, theta: r  # rho upper bound
+    )[0]
+
+    return result
+
+'''
+compute the volume integral of a function in a box with one edge centered at the origin
+Input values 
+- 'f': the function f([x, y, z])
+- 'L': list of sizes of the box [length, height, width]
+Return values: 
+- \int dx_box f
+'''
+def volume_integral_box(f, L):
+    result = spi.tplquad(
+        lambda x, y, z: f([x, y, z]) ,
+        0,  # z lower bound
+        L[2],  # z upper bound
+        lambda z: 0,  # y lower bound
+        lambda z: L[1],  # y upper bound
+        lambda z, y: 0,  # x lower bound
+        lambda z, y: L[0]  # x upper bound
+    )[0]
+
+    return result
+
+
+
+'''
+compute the integral of a function in the region between a ball and a box which has one edge centered at the origin
+Input values 
+- 'f': the function f([x, y, z])
+- 'L': a list containing the sizes of the box along each axis
+- 'r': radius of the ball
+- 'c' : center of the ball
+Return value: 
+- \int_{box - ball} d^3x  f
+'''
+
+def volume_integral_box_minus_ball(f, L, r, c):
+    return volume_integral_box(f, L) - volume_integral_ball(f, r, c)
+
+
+
+# return the matrix of a rotation by an angle 'theta' about the z axis
+def R_z(theta):
+    return [[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]]
+
+
+'''
+A rotation matrix in two dimensions
+Input values: 
+- 'theta': the rotation angle, in radians
+Return values: 
+- the rotation matrix
+'''
+
+
+def R(theta):
+    return np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+
+'''
+derivative of R(theta) with respect to thetat
+Input values: 
+- 'theta': the rotation angle, in radians
+Return values: 
+- dR(theta)/ dtheta
+'''
+def dRddtheta(theta):
+    return np.array([[-np.sin(theta), -np.cos(theta)], [np.cos(theta), -np.sin(theta)]])
+
+
+
+'''
+given a point, returns the point rotated with respect to a point and translated
+Input values: 
+    - `p` = [p_x, p_y], the coordinates of the point
+    - `theta`: the rotation angle
+    - `c`: the rotation center
+    - `t`: the translation vector
+Return values: 
+    - t + c + R(theta).(x-c)
+'''
+
+def rotation_translation(p, theta, c, t):
+
+    return np.add(t, np.add(c, R(theta).dot(np.subtract(p, c))))
+
+
+
+'''
+given a rectangle with its bottom-left corner at the origin and a point inscribed in it, return the minimal distance between the point and the rectangle boundary
+Input values: 
+- 'L', 'h': the length and  height of the rectangle
+- 'p' : the coordinates of the point
+Return values: 
+- the minimal distance
+'''
+
+
+def min_dist_c_r_rectangle(L, h, p):
+    if p[0] < L / 2:
+        min_x = p[0]
+    else:
+        min_x = L - p[0]
+
+    if p[1] < h / 2:
+        min_y = p[1]
+    else:
+        min_y = h - p[1]
+
+    return min(min_x, min_y)
+
+
+
+'''
+given a parallelepiped with its bottom-left corner at the origin and a point inscribed in it, return the minimal distance between the circle center and the parallelepiped boundary
+Input values: 
+- 'L': a list containing the sizes of the parallelepiped along each axis
+- 'p' : the coordinates of the point
+Return values: 
+- the minimal distance
+'''
+def min_dist_c_r_parallelepiped(L, p):
+
+    m = [0] * 3
+
+    for i in range(3):
+        if p[i] < L[i] / 2:
+            m[i] = p[i]
+        else:
+            m[i] = L[i] - p[i]
+
+    return min(m)
+
+
+
+'''
+checks whether a point lies on a line
+Input values: 
+- 'point': the coordinates of the point ( a tuple of two values)
+- 'line': the parametric form of the line, as an output of cal.line
+Return value:
+- True (False) if 'point' lies on 'line' within accuracy 'small_number'
+
+Example of usage:
+gamma_top = lambda t: cal.line(r_2, r_3, t)
+print(f'r_1 is on gamma_top: {cal.point_on_line(np.add(r_2, r_3), gamma_top)}')
+'''
+
+
+def point_on_line(point, line):
+    p_start = (line(0))[0]
+    delta_p = np.subtract((line(1))[0], p_start).tolist()
+
+    num = (p_start[1] - point[1]) * delta_p[0] - (p_start[0] - point[0]) * delta_p[1]
+    den = np.linalg.norm(delta_p)
+
+    return np.isclose(num / den, 0, rtol=small_number)
+
+
+
+'''
+returns True of a points lie on a sexment, and False otherwise
+Input values: 
+    * Mandatory: 
+        - 'p': [p_x, p_y], the coordinates of the point
+        - 'p_1', 'p_2': the coordinates of the poitns that define the segment, defined as 'p'
+    * Optional
+        - 'tol': the length tolerance used to determine the result
+        
+Return values; 
+    - 'True' if 'p' lies on the segment, 'False' otherwise
+'''
+
+def point_on_segment(p, p_1, p_2, tol=const.epsilon):
+
+    d = p_2 - p_1
+    L = np.linalg.norm(d)
+
+    if L < tol:
+        return np.linalg.norm(p - p_1) < tol
+    
+    t = np.dot(p - p_1, d) / L
+
+    return ( np.linalg.norm(p - p_1 - t * d/L) < tol * L ) and ( - tol * L  <= t <= L * (1 + tol))
+
+'''
+mirrors a point with respect to the symmetry axis given by a line
+Input values: 
+- 'point': the coordinates of the point ( a list with two entries)
+- 'line': the parametric form of the line, as an output of cal.line
+Return value:
+- the mirrored point (a list with two entries) 
+
+Example of usage:
+gamma = lambda t: cal.line([0, 1/2], [1,1/2], t)
+mirrored_point = cal.mirror_point_line([1/2,1], gamma)
+'''
+
+
+def mirror_point_line(point, line):
+    p_start = (line(0))[0]
+    p_end = (line(1))[0]
+    delta = np.subtract(p_end, p_start)
+    denominator = (np.linalg.norm(delta)) ** 2
+
+    result = [-point[0] + (2 * (point[0] * delta[0] ** 2 + delta[1] * (-p_start[1] * delta[0] + point[1] * delta[0] + p_start[0] * delta[1]))) / denominator, point[1] + (2 * delta[0] * (p_start[1] * delta[0] - point[1] * delta[0] + (-p_start[0] + point[0]) * delta[1])) / denominator, 0]
+
+    return result
+
+
+'''
+tells whether a line lies on an axis
+Input values: 
+- 'line': a line in a mesh
+- 'gamma_axis': the parametric form of the line, as an output of cal.line
+- 'mesh': the mesh
+Return value:
+- True (False) if 'line' lies (does not lie) on 'gamma_axis'
+
+Example of usage:
+
+for j in range(len(mesh.cells)):
+    if mesh.cells[j].type == 'line':
+        lines = np.copy(mesh.cells[j].data)
+        for i in range(np.shape(lines)[0]):
+            if (not cal.line_on_axis(lines[i], gamma_axis_of_symmetry, mesh)):
+[...]
+'''
+
+
+def line_on_axis(line, gamma_axis, mesh):
+    line_vertex_on_axis = [(point_on_line(mesh.points[line[k]], gamma_axis)) for k in range(len(line))]
+    return (line_vertex_on_axis[0] and line_vertex_on_axis[1])
+
+
+'''
+given a ring mesh and multiple radial lines which start from the origin, check is a line lies on one of these radial lines
+Input values:
+- 'line': a line in the mesh, of type '<class 'numpy.ndarray'>'
+- 'N': the number of radial lines: each line has polar angle theta = 2 \pi/N * i with i = 0, ..., N-1
+- 'mesh': the mesh, a <meshio mesh object>
+Return values: 
+- True/False if 'line' lies on at least one of the 'N' radial lines 
+'''
+
+
+def line_is_radial(line_to_check, N, mesh):
+    # the angular size of each slice delimited by the radial lines
+    theta = 2 * np.pi / N
+
+    is_radial = False
+
+    for i in range(0, N):
+        # loop through the radial lines
+
+        # construct an axis given by the radial line under consideration
+        point_O = [0, 0]
+        point_r = R(i * theta).dot([1, 0])
+        radial_axis = lambda t: line(point_O, point_r, t)
+
+        # check whether 'line_to_check' lies on the axis
+        is_radial = line_on_axis(line_to_check, radial_axis, mesh)
+
+        # if 'line_to_check' lies on the axis, stop
+        if is_radial:
+            break
+
+    return is_radial
+
+
+'''
+given a list of point coordinates, find the minimal distance between all pairs of points in the list
+Input values: 
+    - 'points' = [[point0x, point0y, ...], [point1x, point1y, ...], ] the list containing the coordinates of the points 
+    - 'min_max': 'min' ('max') if one wants the minimal or maximal distance
+
+Return values: 
+    - 'result': the minimal/maximal distance
+'''
+
+def min_max_distance(points, min_max):
+
+    result = None
+    distances = pdist(points)
+
+    if min_max == 'min':
+
+        result = np.min(distances)
+
+    elif min_max == 'max':
+
+        result = np.max(distances)
+
+    else:
+
+        print(f"Error: min_max must be 'min' or 'max', got '{min_max}'")
+        sys.exit(1)
+    
+    return result
+   
+
+'''
+returns the coordinates of the points on an ellipse, obtained by dividing its boundary into a finite number of parts. The ellipse may be rotated about its left focal point
+Input values: 
+    * Mandatory:
+        - 'a', 'b': semi-major and semi-minor axes of the ellipse, respectively
+        - 'c': center of the ellipse, [c_x, c_y]
+        - 'N': number of vertices which divide the ellipse boundary into N-1 segments
+    * Optional:
+        - 'phi': the rotation angle with respect to the x axis, about the left focal point . phi = 0 by default
+
+Return values: 
+    - 'coordiantes', the coordinates of the points along the ellipse boundary, in the format [[p0_x, p0_y], [p1_x, p1_y], ...]
+'''
+def points_ellipse(a, b, c, N, 
+                   phi=0):
+
+    coordinates = []
+    for i in range(N-1):
+        coordinates.append(ellipse(a, b, c, i/(N-1), phi)[0])
+        
+    return coordinates
+
+'''
+return the parametric coordinate 0 <= t <= 1 as defined in the 'ellipse' method corresponding to a point in the plane lying on the boundary of an ellipse
+Input values: 
+    * Mandatory: 
+        - 'x': a two-dimensional list, given by the coordinates of the point lyiung on the ellipse boundary. If the point does not lie on the ellipse boundary, this method still returns a result, but it is no longer 't'
+        - 'a', 'b': semi-major axes of the ellipse
+        - 'c': center of the ellipse, [c_x, c_y]
+    * Optional:
+        - 'phi': the rotation angle of the ellipse about its left focal point, with respect to the x axis
+'''
+def parameteric_coordinate_ellipse(x, a, b, c, phi=0):
+
+    # coordinates of left focal point
+    f = ellipse_focal_points(a, b, c)[0]
+
+    r = np.add(np.subtract(f, c), R(-phi).dot(np.subtract(x, f)))
+
+    return (1.0/(2.0*np.pi) * atan_quad([b * r[0], a * r[1]]))
+
+'''
+return the focal points of an ellipse
+Input values: 
+    - 'a', 'b': the semi-major and minor axes of the ellipse
+    - 'c': the ellipse center [c_x, c_y]
+Return values: 
+    - 'f': [[f_left_x, f_left_y], [f_right_x, f_right_y]], the left and right focal points
+
+'''
+def ellipse_focal_points(a, b, c):
+    return [np.subtract(c, [np.sqrt(a ** 2 - b ** 2), 0]), np.add(c, [np.sqrt(a ** 2 - b ** 2), 0])]
+
+'''
+compute the totatl length of a polygon
+Input values:
+    - 'coordinates': the coordinates of the polygon vertices
+            coordinates = [
+            [p0_x, p0_y, p0_z],
+            [p1_x, p1_y, p1_z],
+            ...
+            ]
+
+Return values: 
+    - 'result' :the total length of the polygon
+'''
+def polygon_length(coordinates):
+
+    result = np.linalg.norm(np.subtract(coordinates[-1], coordinates[0]))
+
+    for i in range(1, len(coordinates)):
+
+        result += np.linalg.norm(np.subtract(coordinates[i], coordinates[i-1]))
+
+    return result
+
+
+'''
+check if a point lies in a box 
+Input values:
+    - 'point': the coordinates of the point [x, y, ...]
+    - 'box': [[x_min, x_max], [y_min, y_max], ...], 
+Return values: 
+    - True if 'point' is in the box, False otherwise
+'''
+def point_in_box(point, box):
+
+    result = True
+
+    for i in range(len(box)):
+        result = result and ((point[i] > box[i][0]) and (point[i] < box[i][1]))
+
+    return result
